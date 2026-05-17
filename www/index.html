@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>R2 Assistant</title>
+  <link rel="stylesheet" href="/static/index.css">
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar">
+      <div id="sidebar-header">
+        <span>Assistants</span>
+        <button id="new-pa-btn" class="icon-btn" type="button" title="New Assistant">+</button>
+      </div>
+      <ul id="pa-list"></ul>
+    </aside>
+
+    <main id="chat">
+      <header id="chat-header">
+        <button id="sidebar-toggle" type="button" title="Toggle sidebar">◀</button>
+        <span id="chat-title">Select or start a session</span>
+      </header>
+      <div id="messages"></div>
+      <div id="input-area">
+        <textarea id="input" placeholder="Message… (Enter to send, Ctrl+Enter for newline)" rows="1"></textarea>
+        <button id="send-btn">Send</button>
+      </div>
+    </main>
+  </div>
+
+  <dialog id="new-pa-dialog">
+    <h3>New Assistant</h3>
+    <form id="new-pa-form">
+      <input type="text" id="new-pa-name-input" placeholder="Name" autocomplete="off" required>
+      <div class="dialog-actions">
+        <button type="button" id="new-pa-cancel">Cancel</button>
+        <button type="submit">Create</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="/static/index.js"></script>
+</body>
+</html>
