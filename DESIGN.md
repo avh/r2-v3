@@ -52,16 +52,28 @@ The message handler automatically takes care of updating long and short term mem
 
 The configuration contains a long term memory file trigger size. Once that size is reached long term memory will be compacted automatically. A local model is used for compaction.
 
+The PA can also write directly to long term memory using the `<<REMEMBER:` tag:
+
+```
+<<REMEMBER:
+important fact to retain across sessions
+>>
+```
+
+This is intended for durable facts (e.g. user preferences, key personal details) that should survive session boundaries without waiting for compaction.
+
 
 ### Use of Long Term Memory
 
 At the start of a PA session, all of the long term memory is inserted into the stream using an FYI tag:
 
 ```
-<<FYI:
-memory items to be used by the agent as needed 
+<<FYI: long-term memory
+memory items to be used by the agent as needed
 >>
 ```
+
+FYI tags carry an optional name annotation (the text after the colon) that identifies the source. Common values: `system`, `long-term memory`, `recent memory`.
 
 The agent is instructed that it can use any information in the FYI tag, but that it should otherwise ignore it.
 
@@ -72,9 +84,15 @@ When long term memory is updated, all active sessions for that PA will receive a
 
 Initially the main way to interact with a PA is through a web interface. 
 
-The web interface is light colored and has a session bar on the left. On the right is a chat window, with an input box at the bottom.
+The web interface is light colored and has a collapsible sidebar on the left. On the right is a chat window, with an input box at the bottom.
 
-The PA's name and the active model are displayed as the title of the chat.
+The PA name and session ID are displayed as the title of the chat. A toggle button (◀/▶) in the chat header collapses or expands the sidebar.
+
+### Sidebar
+
+The sidebar shows a tree of Personal Agents, their sessions, and any active TA sessions as child nodes. Each PA node has a **+** button to add a new session and a **×** button (visible on hover) to delete the PA and all its sessions after confirmation. Each session node has a **×** button to delete that session after confirmation.
+
+A **New Assistant** button at the top of the sidebar opens a dialog to create a new PA. The new PA's first session is created and connected automatically, and the agent immediately starts the conversation by introducing itself and asking for the user's name. Keyboard focus moves to the input box when a session becomes active.
 
 Each message has a type, each type can be hidden, shown, or collapsed. Each message is displayed in a bubble. User messages are right aligned.
 
@@ -104,29 +122,54 @@ This list is not the complete list and will need to be extended to achieve full 
 
 ```json
 { "type": "message", "text": "user input" }
-{ "type": "create_session", "title": "new chat", "session_id": "session-1"}
-{ "type": "select_session", "session_id": "session-1" }
-{ "type": "close_session", "session_id": "session-1" }
-{ "type": "session_list" }
 ```
+
+Session management is handled via the REST API (see below); the WebSocket carries only chat messages.
 
 **Server → Client:**
 
 ```json
-{ "type": "message",       "role": "user",      "text": "..." }
-{ "type": "message",       "role": "assistant",  "text": "...", "partial": true }
-{ "type": "message",       "role": "think",      "text": "...", "partial": true }
-{ "type": "message",       "role": "note",       "text": "..."}
-{ "type": "message",       "role": "fyi",        "text": "..."}
-{ "type": "message",       "role": "question",   "name": "clock", "input": "current time" }
-{ "type": "message",       "role": "answer",     "name": "clock", "content": "5:30pm" }
-{ "type": "message",       "role": "system",     "text": "..." }
-{ "type": "message",       "role": "error",      "text": "..." }
-{ "type": "message",       "role": "image",      "data": "base64..." }
-{ "type": "session_list",  "sessions": [ ... ] }
+{ "type": "message",    "role": "user",      "text": "..." }
+{ "type": "message",    "role": "assistant",  "text": "...", "partial": true }
+{ "type": "message",    "role": "think",      "text": "...", "partial": true }
+{ "type": "message",    "role": "note",       "text": "..." }
+{ "type": "message",    "role": "fyi",        "name": "system", "text": "..." }
+{ "type": "message",    "role": "question",   "name": "clock",  "text": "..." }
+{ "type": "message",    "role": "answer",     "name": "clock",  "text": "..." }
+{ "type": "message",    "role": "system",     "text": "..." }
+{ "type": "message",    "role": "error",      "text": "..." }
+{ "type": "message",    "role": "image",      "data": "base64..." }
+{ "type": "server_info",   "start_time": 1234567890 }
+{ "type": "new_session" }
+{ "type": "transcript",    "html": "..." }
+{ "type": "visibility",    "role": "think", "hidden": true }
+{ "type": "ta_sessions",   "sessions": [ {"agent_name": "clock", "session_id": "clock-abc1"} ] }
 ```
 
-The `partial` flag on assistant/think messages signals streaming chunks. The final chunk (or the only chunk for non-streaming messages) omits `partial` or sets it to `false`.
+The `partial` flag on assistant/think messages signals streaming chunks. The final chunk sets `partial: false`.
+
+`server_info` is sent on every WebSocket connect. If the client has seen a different `start_time` before, it reloads the page to pick up any HTML/JS/CSS changes after a server restart.
+
+`new_session` is sent in response to the `/new` command; the client creates and connects to a new session.
+
+`transcript` is sent in response to the `/save` command; the client opens the HTML in a new browser tab.
+
+`visibility` is sent in response to `/show` and `/hide` commands; the client toggles the display of all existing and future bubbles of that role.
+
+`ta_sessions` is sent whenever a new TA session is started; the client updates the sidebar tree.
+
+### REST API
+
+Session lifecycle is managed via REST:
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/tree` | Full PA→session→TA-session hierarchy |
+| `POST` | `/api/pas` | Create a new PA (body: `{"name": "..."}`) |
+| `DELETE` | `/api/pas/{pa_name}` | Delete a PA and all its sessions |
+| `GET` | `/api/{pa_name}/sessions` | List sessions for a PA |
+| `POST` | `/api/{pa_name}/sessions` | Create a new session |
+| `DELETE` | `/api/{pa_name}/sessions/{session_id}` | Delete a session |
 
 ### Role-UI Mapping
 
@@ -309,7 +352,9 @@ For now we will assume that the user interacting with a PA is the PA's user. We 
 
 ### Creating PAs
 
-When the server is started, and no PAs exist, the user will be asked to provide the PA's name and the user's name, and a new PA will be created.
+PAs are created through the web UI. Clicking the **New Assistant** button in the sidebar opens a dialog to enter the PA's name. The server creates the PA directory and an initial `memory.txt` seeded with the PA's name. A first session is created and connected automatically.
+
+On the very first session for a new PA, the agent auto-starts the conversation — it introduces itself and asks the user for their name — without requiring an initial message from the user.
 
 
 ### Initial TAs
@@ -344,14 +389,22 @@ In order to experiment with new TAs, it should be possible to create a placehold
 
 ### System Commands
 
-The following system commands are supported:
+System commands are intercepted by the server before reaching the model. The following commands are supported:
 
-* ```/think [on|off|hide|show]``` - control thinking, default on
-* ```/status``` - display status such as model/agent/etc.
-* ```/time``` - for the last message display time to first token, tokens per second, number of tokens, time to complete
-* ```/memory [short|long]``` - display memory contents
-* ```/new``` - close this session and start a new one from scratch
-* ```/save``` - create a human readable transcript of the current session, including TA calls, thinking etc. for later review. Display as a new tab in the browser.
+| Command | Description |
+|---------|-------------|
+| `/help` | List available commands |
+| `/think [on\|off]` | Enable or disable model thinking |
+| `/show [type]` | Show bubbles of that type, or list current visibility |
+| `/hide [type]` | Hide bubbles of that type, or list current visibility |
+| `/status` | Display PA name, session ID, and current model |
+| `/time` | Show timing stats for the last response (TTFT, TPS, token count, total time) |
+| `/memory [short\|long]` | Display short-term or long-term memory contents |
+| `/prompt` | Show the full session preamble (system prompt + startup FYIs) |
+| `/new` | Flush short-term notes to long-term memory and start a new session |
+| `/save` | Open an HTML transcript of the current session in a new browser tab |
+
+Bubble types that can be shown/hidden: `think`, `note`, `fyi`, `question`, `answer`, `system`, `error`.
 
 
 ### Model Backend
