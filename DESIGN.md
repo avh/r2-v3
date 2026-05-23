@@ -403,6 +403,8 @@ System commands are intercepted by the server before reaching the model. The fol
 | `/prompt` | Show the full session preamble (system prompt + startup FYIs) |
 | `/new` | Flush short-term notes to long-term memory and start a new session |
 | `/save` | Open an HTML transcript of the current session in a new browser tab |
+| `/close` | Close this session and return to the session list |
+| `/reset` | Restart this session — clears conversation history but keeps memory on disk, then reconnects exactly as after a server restart |
 
 Bubble types that can be shown/hidden: `think`, `note`, `fyi`, `question`, `answer`, `system`, `error`.
 

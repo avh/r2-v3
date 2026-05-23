@@ -11,6 +11,10 @@ class Backend(ABC):
     async def stream_chat(self, messages: list[dict], config: dict) -> AsyncIterator[str]:
         ...
 
+    @abstractmethod
+    async def chat(self, messages: list[dict], config: dict, tools: list[dict] | None = None) -> dict:
+        ...
+
 
 class OmlxBackend(Backend):
     async def stream_chat(self, messages: list[dict], config: dict) -> AsyncIterator[str]:
@@ -25,6 +29,8 @@ class OmlxBackend(Backend):
         }
         if config.get("thinking"):
             payload["thinking"] = True
+            if config.get("budget_tokens"):
+                payload["budget_tokens"] = config["budget_tokens"]
 
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
@@ -49,6 +55,19 @@ class OmlxBackend(Backend):
                     text = delta.get("content") or ""
                     if text:
                         yield text
+
+    async def chat(self, messages: list[dict], config: dict, tools: list[dict] | None = None) -> dict:
+        url = config.get("mlx_url", "http://localhost:8000/v1/chat/completions")
+        api_key = os.environ.get("MLX_API_KEY", "")
+        model_name = config["model"].split(":", 1)[1]
+        payload: dict = {"model": model_name, "messages": messages}
+        if tools:
+            payload["tools"] = tools
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+            resp.raise_for_status()
+            return resp.json()
 
 
 class OpenAIBackend(Backend):
@@ -83,9 +102,25 @@ class OpenAIBackend(Backend):
                     if text:
                         yield text
 
+    async def chat(self, messages: list[dict], config: dict, tools: list[dict] | None = None) -> dict:
+        api_key = os.environ.get("OPENAI_API_KEY", "")
+        model_name = config["model"].split(":", 1)[1] if ":" in config["model"] else config["model"]
+        url = "https://api.openai.com/v1/chat/completions"
+        payload: dict = {"model": model_name, "messages": messages}
+        if tools:
+            payload["tools"] = tools
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+            resp.raise_for_status()
+            return resp.json()
+
 
 class OllamaBackend(Backend):
     async def stream_chat(self, messages: list[dict], config: dict) -> AsyncIterator[str]:
+        raise NotImplementedError("Ollama backend not yet implemented")
+
+    async def chat(self, messages: list[dict], config: dict, tools: list[dict] | None = None) -> dict:
         raise NotImplementedError("Ollama backend not yet implemented")
 
 

@@ -21,12 +21,51 @@ class TASession:
     pa_name: str
     pa_session_id: str
     agent_name: str
+    pa_session: "PASession"
     session_id: str = field(default="")
     created_at: float = field(default_factory=time.time)
+
+    status: str = field(default="pending", init=False)   # "pending" | "done"
+    _answer_event: asyncio.Event | None = field(default=None, init=False, repr=False)
+    _user_answer: str | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
         if not self.session_id:
             self.session_id = f"{self.agent_name}-{uuid.uuid4().hex[:8]}"
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def session_dir(self) -> Path:
+        return _base_dir() / self.pa_name / self.pa_session_id / self.session_id
+
+    def log(self, role: str, text: str):
+        with open(self.session_dir / "log.txt", "a") as f:
+            f.write(f"[{role}]\n{text}\n\n")
+
+    async def send(self, msg: dict):
+        """Forward a message to the parent PA session's WebSocket."""
+        await self.pa_session.send(msg)
+
+    async def wait_for_input(self, question: str) -> str:
+        """Send ta_input_needed to the client and suspend until the user replies."""
+        if self._answer_event is None:
+            self._answer_event = asyncio.Event()
+        self._answer_event.clear()
+        self._user_answer = None
+        await self.send({
+            "type": "ta_input_needed",
+            "agent_name": self.agent_name,
+            "ta_session_id": self.session_id,
+            "question": question,
+        })
+        await self._answer_event.wait()
+        return self._user_answer or ""
+
+    def set_answer(self, text: str):
+        """Called by the server when the user submits a ta_input message."""
+        self._user_answer = text
+        if self._answer_event is not None:
+            self._answer_event.set()
 
 
 @dataclass
@@ -34,18 +73,66 @@ class PASession:
     pa_name: str
     session_id: str
     config: dict
-    send: Callable[[dict], Awaitable[None]]  # pushes msg to the WS client
+    send_fn: Callable[[dict], Awaitable[None]]  # raw WS callback; use send() to send
 
     queue: asyncio.Queue = field(default_factory=asyncio.Queue)
     ta_sessions: dict[str, TASession] = field(default_factory=dict)
     history: list[dict] = field(default_factory=list)
     task: asyncio.Task | None = field(default=None, init=False)
 
+    # Replay log: finalised messages suitable for replaying to a newly connected client
+    msg_log: list[dict] = field(default_factory=list, repr=False)
+    # Accumulator for in-progress streaming messages keyed by role
+    stream_acc: dict = field(default_factory=dict, repr=False, init=False)
+
     # timing for /time command
     last_ttft: float | None = field(default=None, init=False)
     last_tps: float | None = field(default=None, init=False)
     last_tokens: int = field(default=0, init=False)
     last_duration: float | None = field(default=None, init=False)
+
+    async def send(self, msg: dict) -> None:
+        """Send msg to the client and record it in msg_log for later replay."""
+        msg_type = msg.get("type")
+        role = msg.get("role")
+        if msg_type == "message":
+            if msg.get("partial") is True:
+                # Accumulate streaming chunks; don't log yet
+                if role not in self.stream_acc:
+                    entry: dict = {"type": "message", "role": role, "text": ""}
+                    if "name" in msg:
+                        entry["name"] = msg["name"]
+                    self.stream_acc[role] = entry
+                self.stream_acc[role]["text"] += msg.get("text", "")
+            elif msg.get("partial") is False:
+                # Stream ended — commit the accumulated message if it has content
+                entry = self.stream_acc.pop(role, None)
+                if entry and entry["text"].strip():
+                    self.msg_log.append(entry)
+            else:
+                # Non-streaming message (note, fyi, error, system, …)
+                self.msg_log.append(msg)
+        elif msg_type in ("visibility", "ta_sessions"):
+            self.msg_log.append(msg)
+        elif msg_type == "ta_message":
+            ta_partial = msg.get("partial")
+            ta_sid = msg.get("ta_session_id", "")
+            ta_role = msg.get("role", "")
+            acc_key = f"ta_{ta_sid}_{ta_role}"
+            if ta_partial is True:
+                if acc_key not in self.stream_acc:
+                    self.stream_acc[acc_key] = {
+                        "type": "ta_message", "ta_session_id": ta_sid,
+                        "agent_name": msg.get("agent_name", ""), "role": ta_role, "text": "",
+                    }
+                self.stream_acc[acc_key]["text"] += msg.get("text", "")
+            elif ta_partial is False:
+                entry = self.stream_acc.pop(acc_key, None)
+                if entry and entry["text"].strip():
+                    self.msg_log.append(entry)
+            else:
+                self.msg_log.append(msg)
+        await self.send_fn(msg)
 
     @property
     def session_dir(self) -> Path:
@@ -85,7 +172,7 @@ class PASession:
     def write_long_memory(self, content: str):
         path = _base_dir() / self.pa_name / "memory.txt"
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content)
+        path.write_text(content.rstrip() + "\n")
 
     def log(self, role: str, text: str):
         self.ensure_dirs()
@@ -105,6 +192,7 @@ class PASession:
                 pa_name=self.pa_name,
                 pa_session_id=self.session_id,
                 agent_name=agent_name,
+                pa_session=self,
             )
         return self.ta_sessions[agent_name]
 
@@ -130,13 +218,13 @@ class SessionRegistry:
         pa_sessions = self._sessions.setdefault(pa_name, {})
         created = False
         if session_id not in pa_sessions:
-            session = PASession(pa_name=pa_name, session_id=session_id, config=config, send=send)
+            session = PASession(pa_name=pa_name, session_id=session_id, config=config, send_fn=send)
             session.ensure_dirs()
             pa_sessions[session_id] = session
             created = True
         else:
             # Update the send callback when the client reconnects
-            pa_sessions[session_id].send = send
+            pa_sessions[session_id].send_fn = send
         return pa_sessions[session_id], created
 
     def get(self, pa_name: str, session_id: str) -> PASession | None:

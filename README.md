@@ -103,6 +103,8 @@ The interface has a collapsible sidebar (PAs → sessions → TA sessions) and a
 | `/prompt` | Show the full session preamble |
 | `/new` | Start a fresh session (flushes notes to long-term memory) |
 | `/save` | Open session transcript in a new tab |
+| `/close` | Close this session and return to the session list |
+| `/reset` | Restart this session (keeps memory, clears conversation) |
 
 ## Memory
 

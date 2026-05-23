@@ -1,6 +1,7 @@
 """Personal Agent — model loop, memory, TA routing, system commands."""
 
 import asyncio
+import shutil
 import time
 import zoneinfo
 from datetime import datetime
@@ -9,14 +10,14 @@ from pathlib import Path
 from src.models import get_backend
 from src.prompts import build_system_prompt
 from src.stream_parser import StreamParser
-from src.session import PASession
+from src.session import PASession, registry
 
 ROOT = Path(__file__).parent.parent.parent.parent
 AGENTS_DIR = ROOT / "src" / "agents"
 
-_SYSTEM_COMMANDS = {"/think", "/status", "/time", "/memory", "/new", "/save", "/help", "/show", "/hide", "/prompt"}
+_SYSTEM_COMMANDS = {"/think", "/status", "/time", "/memory", "/new", "/save", "/help", "/show", "/hide", "/prompt", "/close", "/reset"}
 
-_SHOWABLE_ROLES = {"think", "note", "fyi", "question", "answer", "system"}
+_SHOWABLE_ROLES = {"think", "note", "remember", "fyi", "question", "answer", "system"}
 
 _HELP_TEXT = """\
 Available commands:
@@ -33,6 +34,8 @@ Available commands:
 | `/prompt` | Show the full session preamble (system prompt + injected context) |
 | `/new` | Start a new session |
 | `/save` | Open session transcript in a new tab |
+| `/close` | Close this session and return to the session list |
+| `/reset` | Restart this session (keeps memory, clears conversation) |
 
 Bubble types: """ + ", ".join(f"`{r}`" for r in sorted(_SHOWABLE_ROLES))
 
@@ -157,6 +160,17 @@ async def _handle_system_command(session: PASession, text: str) -> bool:
         transcript = _build_transcript(session)
         await session.send({"type": "transcript", "html": transcript})
 
+    elif cmd == "/close":
+        await session.send({"type": "close_session"})
+        return "exit"
+
+    elif cmd == "/reset":
+        session.history.clear()
+        session.msg_log.clear()
+        session.stream_acc.clear()
+        await session.send({"type": "reset_session"})
+        return "exit"
+
     return True
 
 
@@ -235,6 +249,13 @@ async def run_pa_session(session: PASession):
     """Main loop for a PA session. Runs as an asyncio task."""
     system_prompt = _build_system_prompt(session.pa_name)
 
+    # Clean up TA sessions from any previous run of this session
+    session.close_ta_sessions()
+    if session.session_dir.exists():
+        for sub in list(session.session_dir.iterdir()):
+            if sub.is_dir() and not sub.name.startswith("."):
+                shutil.rmtree(sub, ignore_errors=True)
+
     # Determine session status
     short_mem = session.read_short_memory()
     pa_dir = session.session_dir.parent
@@ -281,8 +302,10 @@ async def run_pa_session(session: PASession):
 
     backend = get_backend(session.config.get("model", "openai:gpt-4o-mini"))
 
-    if not prior_sessions:
-        await _call_model(session, backend, system_prompt)
+    orig_thinking = session.config.get("thinking", False)
+    session.config["thinking"] = False
+    await _call_model(session, backend, system_prompt)
+    session.config["thinking"] = orig_thinking
 
     while True:
         item = await session.queue.get()
@@ -294,7 +317,10 @@ async def run_pa_session(session: PASession):
                 continue
 
             if user_text.startswith("/"):
-                if await _handle_system_command(session, user_text):
+                result = await _handle_system_command(session, user_text)
+                if result == "exit":
+                    return
+                if result:
                     continue
 
             session.log("user", user_text)
@@ -307,10 +333,21 @@ async def run_pa_session(session: PASession):
             ta_msg = f"<<A: {agent_name}\n{answer}\n>>"
             session.history.append({"role": "user", "content": ta_msg})
             session.log("answer", f"{agent_name}: {answer}")
-            await session.send({"type": "message", "role": "answer",
-                                "name": agent_name, "text": answer})
-            # Feed the TA answer back to the model so it can complete its response
+            if answer.strip():
+                await session.send({"type": "message", "role": "answer",
+                                    "name": agent_name, "text": answer})
             await _call_model(session, backend, system_prompt)
+
+
+async def _broadcast_memory_update(session: PASession, body: str):
+    """Push a memory-update FYI to every other active session for this PA."""
+    fyi_content = f"<<FYI: memory update\n{body}\n>>"
+    for other in list(registry._sessions.get(session.pa_name, {}).values()):
+        if other.session_id == session.session_id:
+            continue
+        other.history.append({"role": "user", "content": fyi_content})
+        other.log("fyi", f"[memory update]\n{body}")
+        await other.send({"type": "message", "role": "fyi", "name": "memory update", "text": body})
 
 
 async def _handle_event(session: PASession, event: tuple):
@@ -325,24 +362,47 @@ async def _handle_event(session: PASession, event: tuple):
             existing = session.read_long_memory()
             session.write_long_memory((existing + "\n" + body).strip())
             session.log("remember", body)
-            await session.send({"type": "message", "role": "note", "text": f"[remembered] {body}"})
+            await session.send({"type": "message", "role": "remember", "text": body})
+            await _broadcast_memory_update(session, body)
         elif tag == "FYI":
             session.log("fyi", f"[{name}]\n{body}" if name else body)
             await session.send({"type": "message", "role": "fyi", "name": name, "text": body})
         elif tag == "Q":
             session.log("question", f"{name}: {body}")
             await session.send({"type": "message", "role": "question", "name": name, "text": body})
-            session.get_ta_session(name)  # ensure TA session exists before dispatch
-            await session.send({"type": "ta_sessions", "sessions": [
-                {"agent_name": n, "session_id": ts.session_id}
-                for n, ts in session.ta_sessions.items()
-            ]})
+            ts = session.get_ta_session(name)
+            await _send_ta_sessions(session)
+            await session.send({"type": "ta_message", "ta_session_id": ts.session_id,
+                               "agent_name": name, "role": "question", "text": body})
             asyncio.create_task(_dispatch_and_reply(session, name, body))
+
+
+async def _send_ta_sessions(session: PASession):
+    await session.send({"type": "ta_sessions", "sessions": [
+        {"agent_name": n, "ta_session_id": ts.session_id, "status": ts.status}
+        for n, ts in session.ta_sessions.items()
+    ]})
+
+
+async def handle_ta_direct(session: PASession, agent_name: str, question: str):
+    """Dispatch a question straight to a TA without touching PA history."""
+    ta_session = session.get_ta_session(agent_name)
+    ta_session.status = "pending"
+    await _send_ta_sessions(session)
+    try:
+        await _dispatch_ta(session, agent_name, question)
+    finally:
+        ta_session.status = "done"
+        await _send_ta_sessions(session)
 
 
 async def _dispatch_and_reply(session: PASession, agent_name: str, question: str):
     """Dispatch question to TA and push answer into the PA's queue."""
     answer = await _dispatch_ta(session, agent_name, question)
+    ta = session.ta_sessions.get(agent_name)
+    if ta:
+        ta.status = "done"
+    await _send_ta_sessions(session)
     await session.queue.put({"type": "ta_answer", "name": agent_name, "text": answer})
 
 

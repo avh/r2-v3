@@ -1,11 +1,13 @@
-"""Help Tool Agent — lists available agents and their descriptions."""
+"""Help Tool Agent — uses a model to identify relevant agents for a question."""
 
 from pathlib import Path
 
+from src.agents.ta_base import run_ta_model
+
 ROOT = Path(__file__).parent.parent.parent.parent
 AGENTS_DIR = ROOT / "src" / "agents"
+_SYSTEM_PROMPT = (Path(__file__).parent / "system.txt").read_text().strip()
 
-# Agents not exposed to PAs
 _HIDDEN = {"personal"}
 
 
@@ -25,7 +27,6 @@ def _get_agent_descriptions() -> dict[str, str]:
 
 async def handle_question(question: str, ta_session) -> str:
     descriptions = _get_agent_descriptions()
-    if not descriptions:
-        return "No Tool Agents are currently available."
-    lines = [f"- **{name}**: {desc}" for name, desc in descriptions.items()]
-    return "Available agents:\n" + "\n".join(lines)
+    agents_list = "\n".join(f"- {name}: {desc}" for name, desc in descriptions.items())
+    augmented = f"Available agents:\n{agents_list}\n\nQuestion: {question}"
+    return await run_ta_model(augmented, _SYSTEM_PROMPT, ta_session)

@@ -44,15 +44,16 @@ class StreamParser:
 
         while self._buf:
             if self._in_tag:
-                close_pos = self._buf.find(_CLOSE)
+                # Search the combined buffer so >> split across chunks is detected.
+                combined = self._tag_buf + self._buf
+                close_pos = combined.find(_CLOSE)
                 if close_pos == -1:
-                    # wait for more data
-                    self._tag_buf += self._buf
+                    self._tag_buf = combined
                     self._buf = ""
+                    break
                 else:
-                    self._tag_buf += self._buf[:close_pos]
-                    self._buf = self._buf[close_pos + 2:]
-                    body = self._tag_buf.strip()
+                    body = combined[:close_pos].strip()
+                    self._buf = combined[close_pos + 2:]
                     events.append(("tag", self._current_tag, self._current_name, body))
                     self._in_tag = False
                     self._tag_buf = ""
@@ -119,7 +120,13 @@ class StreamParser:
     def flush(self) -> list[tuple]:
         events: list[tuple] = []
         if self._in_tag and self._tag_buf:
-            events.append(("tag", self._current_tag, self._current_name, self._tag_buf.strip()))
+            body = self._tag_buf.strip()
+            # Strip a partial or accidental closer the model may have included
+            if body.endswith(">>"):
+                body = body[:-2].strip()
+            elif body.endswith(">"):
+                body = body[:-1].strip()
+            events.append(("tag", self._current_tag, self._current_name, body))
             self._in_tag = False
             self._tag_buf = ""
         if self._buf:

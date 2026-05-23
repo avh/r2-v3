@@ -26,7 +26,7 @@ app.mount("/static", StaticFiles(directory=str(WWW)), name="static")
 
 from src.config import load_config
 from src.session import registry, PASession
-from src.agents.personal.agent import run_pa_session
+from src.agents.personal.agent import run_pa_session, handle_ta_direct
 
 
 def _load_pa_config(pa_name: str) -> dict:
@@ -71,23 +71,35 @@ async def get_tree():
     result = []
     if not base.exists():
         return JSONResponse(result)
+    def _ctime(d: Path) -> float:
+        st = d.stat()
+        return getattr(st, "st_birthtime", st.st_ctime)
+
     for pa_dir in sorted(base.iterdir()):
         if not pa_dir.is_dir() or pa_dir.name.startswith("."):
             continue
         sessions = []
-        for sess_dir in sorted(pa_dir.iterdir()):
+        for sess_dir in sorted(pa_dir.iterdir(), key=_ctime):
             if not sess_dir.is_dir() or sess_dir.name.startswith("."):
                 continue
             sess = registry.get(pa_dir.name, sess_dir.name)
             ta_sessions = []
             if sess:
                 ta_sessions = [
-                    {"agent_name": n, "session_id": ts.session_id}
+                    {"agent_name": n, "ta_session_id": ts.session_id, "status": ts.status}
                     for n, ts in sess.ta_sessions.items()
                 ]
             sessions.append({"session_id": sess_dir.name, "ta_sessions": ta_sessions})
         result.append({"pa_name": pa_dir.name, "sessions": sessions})
     return JSONResponse(result)
+
+
+@app.get("/api/ta/{agent_name}/prompt")
+async def get_ta_prompt(agent_name: str):
+    prompt_path = ROOT / "src" / "agents" / agent_name / "system.txt"
+    if prompt_path.exists():
+        return JSONResponse({"prompt": prompt_path.read_text().strip()})
+    return JSONResponse({"prompt": ""})
 
 
 @app.get("/api/{pa_name}/sessions")
@@ -154,6 +166,11 @@ async def websocket_endpoint(websocket: WebSocket, pa_name: str, session_id: str
     config = _load_pa_config(pa_name)
     session, created = registry.get_or_create(pa_name, session_id, config, send)
 
+    # Replay message history to a client reconnecting to an existing session
+    if not created:
+        for msg in session.msg_log:
+            await send(msg)
+
     # Start the PA processing task if not already running
     if session.task is None or session.task.done():
         session.task = asyncio.create_task(run_pa_session(session))
@@ -186,10 +203,24 @@ async def websocket_endpoint(websocket: WebSocket, pa_name: str, session_id: str
                 sel_id = msg.get("session_id")
                 sel_session = registry.get(pa_name, sel_id)
                 if sel_session:
-                    sel_session.send = send
+                    sel_session.send_fn = send
                     if sel_session.task is None or sel_session.task.done():
                         sel_session.task = asyncio.create_task(run_pa_session(sel_session))
                     await send({"type": "session_selected", "session_id": sel_id})
+
+            elif msg_type == "ta_input":
+                ta_sid = msg.get("ta_session_id")
+                answer = msg.get("text", "")
+                for ta_sess in session.ta_sessions.values():
+                    if ta_sess.session_id == ta_sid:
+                        ta_sess.set_answer(answer)
+                        break
+
+            elif msg_type == "ta_direct_question":
+                agent_name = msg.get("agent_name", "").strip()
+                text = msg.get("text", "").strip()
+                if agent_name and text:
+                    asyncio.create_task(handle_ta_direct(session, agent_name, text))
 
             elif msg_type == "close_session":
                 close_id = msg.get("session_id")
