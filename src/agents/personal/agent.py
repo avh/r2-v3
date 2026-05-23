@@ -58,6 +58,8 @@ async def _dispatch_ta(session: PASession, agent_name: str, question: str) -> st
             from src.agents.clock.agent import handle_question
         elif agent_name == "weather":
             from src.agents.weather.agent import handle_question
+        elif agent_name == "aviation":
+            from src.agents.aviation.agent import handle_question
         else:
             return f"Unknown agent: {agent_name}"
         ta_session = session.get_ta_session(agent_name)
